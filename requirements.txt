@@ -7,7 +7,7 @@ einops
 opencv-python
 numpy
 torch
-transformers
+transformers==4.49.0
 torchvision
 torchaudio
 ConfigArgParse
@@ -33,4 +33,5 @@ fastapi
 uvicorn
 gradio_litmodel3d
 tritonclient
-mmgp
+mmgp==3.2.7
+diso

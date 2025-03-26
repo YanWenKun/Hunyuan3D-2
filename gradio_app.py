@@ -641,6 +641,23 @@ def build_app():
 
     return demo
 
+def replace_property_getter(instance, property_name, new_getter):
+    # Get the original class and property
+    original_class = type(instance)
+    original_property = getattr(original_class, property_name)
+    
+    # Create a custom subclass for this instance
+    custom_class = type(f'Custom{original_class.__name__}', (original_class,), {})
+    
+    # Create a new property with the new getter but same setter
+    new_property = property(new_getter, original_property.fset)
+    setattr(custom_class, property_name, new_property)
+    
+    # Change the instance's class
+    instance.__class__ = custom_class
+    
+    return instance
+
 
 if __name__ == '__main__':
     import argparse
@@ -657,7 +674,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--mc_algo', type=str, default='mc')
+    parser.add_argument('--mc_algo', type=str, default='dmc')
     parser.add_argument('--cache-path', type=str, default='gradio_cache')
     parser.add_argument('--enable_t23d', action='store_true')
     parser.add_argument('--disable_tex', action='store_true')
@@ -666,8 +683,32 @@ if __name__ == '__main__':
     parser.add_argument('--low_vram_mode', action='store_true')
     parser.add_argument('--profile', type=str, default="4")
     parser.add_argument('--verbose', type=str, default="1")
+    parser.add_argument('--mini', action='store_true')
+    parser.add_argument('--turbo', action='store_true')
+    parser.add_argument('--mv', action='store_true')
+    parser.add_argument('--h2', action='store_true')
 
     args = parser.parse_args()
+
+    if args.mini:
+        args.model_path = "tencent/Hunyuan3D-2mini"
+        args.subfolder=  "hunyuan3d-dit-v2-mini"
+        args.texgen_model_path = "tencent/Hunyuan3D-2"
+
+    if args.mv:
+        args.model_path = "tencent/Hunyuan3D-2mv"
+        args.subfolder=  "hunyuan3d-dit-v2-mv"
+        args.texgen_model_path = "tencent/Hunyuan3D-2"
+
+
+    if args.h2:
+        args.model_path = "tencent/Hunyuan3D-2"
+        args.subfolder=  "hunyuan3d-dit-v2-0"
+        args.texgen_model_path = "tencent/Hunyuan3D-2"
+
+    if args.turbo:
+        args.subfolder= args.subfolder  + "-turbo"
+        args.enable_flashvdm = True
 
     SAVE_DIR = args.cache_path
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -720,7 +761,7 @@ if __name__ == '__main__':
             print('Please try to install requirements by following README.md')
             HAS_TEXTUREGEN = False
 
-    HAS_T2I = True
+    HAS_T2I = False
     if args.enable_t23d:
         try:
             from hy3dgen.text2image import HunyuanDiTPipeline
@@ -740,7 +781,7 @@ if __name__ == '__main__':
         args.model_path,
         subfolder=args.subfolder,
         use_safetensors=True,
-        device="cpu",
+        device=args.device,
     )
     if args.enable_flashvdm:
         mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
@@ -754,6 +795,7 @@ if __name__ == '__main__':
   
     profile = int(args.profile) 
     kwargs = {}
+    replace_property_getter(i23d_worker, "_execution_device", lambda self : "cuda")
     pipe = offload.extract_models("i23d_worker", i23d_worker)
     if HAS_TEXTUREGEN:
         pipe.update(  offload.extract_models( "texgen_worker", texgen_worker))
@@ -767,6 +809,7 @@ if __name__ == '__main__':
     if profile !=1 and profile !=3:
         kwargs["budgets"] = { "*" : 2200 }
 
+    offload.default_verboseLevel = verboseLevel = int(args.verbose)
     offload.profile(pipe, profile_no = profile, verboseLevel = int(args.verbose), **kwargs)
 
 

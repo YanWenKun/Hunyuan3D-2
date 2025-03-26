@@ -699,9 +699,10 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
+        device =  torch.device("cuda")  #self.device
         self.set_surface_extractor(mc_algo)
 
-        device =  torch.device("cuda")  #self.device
+        # device = self.device
         dtype = self.dtype
         do_classifier_free_guidance = guidance_scale >= 0 and not (
             hasattr(self.model, 'guidance_embed') and
