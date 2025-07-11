@@ -12,16 +12,67 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-import os
 
+import os
+from typing import Union, List
+
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
 
-from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder
+from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder, PointCrossAttentionEncoder
 from .surface_extractors import MCSurfaceExtractor, SurfaceExtractors
 from .volume_decoders import VanillaVolumeDecoder, FlashVDMVolumeDecoding, HierarchicalVolumeDecoding
 from ...utils import logger, synchronize_timer, smart_load_model
+
+
+class DiagonalGaussianDistribution(object):
+    def __init__(self, parameters: Union[torch.Tensor, List[torch.Tensor]], deterministic=False, feat_dim=1):
+        self.feat_dim = feat_dim
+        self.parameters = parameters
+
+        if isinstance(parameters, list):
+            self.mean = parameters[0]
+            self.logvar = parameters[1]
+        else:
+            self.mean, self.logvar = torch.chunk(parameters, 2, dim=feat_dim)
+
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = torch.zeros_like(self.mean)
+
+    def sample(self):
+        x = self.mean + self.std * torch.randn_like(self.mean)
+        return x
+
+    def kl(self, other=None, dims=(1, 2, 3)):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        else:
+            if other is None:
+                return 0.5 * torch.mean(torch.pow(self.mean, 2)
+                                        + self.var - 1.0 - self.logvar,
+                                        dim=dims)
+            else:
+                return 0.5 * torch.mean(
+                    torch.pow(self.mean - other.mean, 2) / other.var
+                    + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                    dim=dims)
+
+    def nll(self, sample, dims=(1, 2, 3)):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        logtwopi = np.log(2.0 * np.pi)
+        return 0.5 * torch.sum(
+            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
+            dim=dims)
+
+    def mode(self):
+        return self.mean
 
 
 class VectsetVAE(nn.Module):
@@ -89,6 +140,21 @@ class VectsetVAE(nn.Module):
             **kwargs
         )
 
+    def init_from_ckpt(self, path, ignore_keys=()):
+        state_dict = torch.load(path, map_location="cpu")
+        state_dict = state_dict.get("state_dict", state_dict)
+        keys = list(state_dict.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del state_dict[k]
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+            print(f"Unexpected Keys: {unexpected}")
+
     def __init__(
         self,
         volume_decoder=None,
@@ -138,6 +204,11 @@ class ShapeVAE(VectsetVAE):
         width: int,
         heads: int,
         num_decoder_layers: int,
+        num_encoder_layers: int = 8,
+        pc_size: int = 5120,
+        pc_sharpedge_size: int = 5120,
+        point_feats: int = 3,
+        downsample_ratio: int = 20,
         geo_decoder_downsample_ratio: int = 1,
         geo_decoder_mlp_expand_ratio: int = 4,
         geo_decoder_ln_post: bool = True,
@@ -148,12 +219,31 @@ class ShapeVAE(VectsetVAE):
         label_type: str = "binary",
         drop_path_rate: float = 0.0,
         scale_factor: float = 1.0,
+        use_ln_post: bool = True,
+        ckpt_path=None
     ):
         super().__init__()
         self.geo_decoder_ln_post = geo_decoder_ln_post
+        self.downsample_ratio = downsample_ratio
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
 
+        self.encoder = PointCrossAttentionEncoder(
+            fourier_embedder=self.fourier_embedder,
+            num_latents=num_latents,
+            downsample_ratio=self.downsample_ratio,
+            pc_size=pc_size,
+            pc_sharpedge_size=pc_sharpedge_size,
+            point_feats=point_feats,
+            width=width,
+            heads=heads,
+            layers=num_encoder_layers,
+            qkv_bias=qkv_bias,
+            use_ln_post=use_ln_post,
+            qk_norm=qk_norm
+        )
+
+        self.pre_kl = nn.Linear(width, embed_dim * 2)
         self.post_kl = nn.Linear(embed_dim, width)
 
         self.transformer = Transformer(
@@ -183,7 +273,26 @@ class ShapeVAE(VectsetVAE):
         self.scale_factor = scale_factor
         self.latent_shape = (num_latents, embed_dim)
 
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path)
+
     def forward(self, latents):
+        latents = self.post_kl(latents)
+        latents = self.transformer(latents)
+        return latents
+
+    def encode(self, surface, sample_posterior=True):
+        pc, feats = surface[:, :, :3], surface[:, :, 3:]
+        latents, _ = self.encoder(pc, feats)
+        moments = self.pre_kl(latents)
+        posterior = DiagonalGaussianDistribution(moments, feat_dim=-1)
+        if sample_posterior:
+            latents = posterior.sample()
+        else:
+            latents = posterior.mode()
+        return latents
+
+    def decode(self, latents):
         latents = self.post_kl(latents)
         latents = self.transformer(latents)
         return latents

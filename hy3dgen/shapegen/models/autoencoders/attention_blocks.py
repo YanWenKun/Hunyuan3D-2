@@ -14,11 +14,12 @@
 
 
 import os
-from typing import Optional
+from typing import Optional, Union, List
 
 import torch
 import torch.nn as nn
 from einops import rearrange
+from torch import Tensor
 
 from .attention_processors import CrossAttentionProcessor
 from ...utils import logger
@@ -491,3 +492,208 @@ class CrossAttentionDecoder(nn.Module):
             x = self.ln_post(x)
         occ = self.output_proj(x)
         return occ
+
+
+def fps(
+    src: torch.Tensor,
+    batch: Optional[Tensor] = None,
+    ratio: Optional[Union[Tensor, float]] = None,
+    random_start: bool = True,
+    batch_size: Optional[int] = None,
+    ptr: Optional[Union[Tensor, List[int]]] = None,
+):
+    src = src.float()
+    from torch_cluster import fps as fps_fn
+    output = fps_fn(src, batch, ratio, random_start, batch_size, ptr)
+    return output
+
+
+class PointCrossAttentionEncoder(nn.Module):
+
+    def __init__(
+        self, *,
+        num_latents: int,
+        downsample_ratio: float,
+        pc_size: int,
+        pc_sharpedge_size: int,
+        fourier_embedder: FourierEmbedder,
+        point_feats: int,
+        width: int,
+        heads: int,
+        layers: int,
+        normal_pe: bool = False,
+        qkv_bias: bool = True,
+        use_ln_post: bool = False,
+        use_checkpoint: bool = False,
+        qk_norm: bool = False
+    ):
+
+        super().__init__()
+
+        self.use_checkpoint = use_checkpoint
+        self.num_latents = num_latents
+        self.downsample_ratio = downsample_ratio
+        self.point_feats = point_feats
+        self.normal_pe = normal_pe
+
+        if pc_sharpedge_size == 0:
+            print(
+                f'PointCrossAttentionEncoder INFO: pc_sharpedge_size is not given, using pc_size as pc_sharpedge_size')
+        else:
+            print(
+                f'PointCrossAttentionEncoder INFO: pc_sharpedge_size is given, using pc_size={pc_size}, pc_sharpedge_size={pc_sharpedge_size}')
+
+        self.pc_size = pc_size
+        self.pc_sharpedge_size = pc_sharpedge_size
+
+        self.fourier_embedder = fourier_embedder
+
+        self.input_proj = nn.Linear(self.fourier_embedder.out_dim + point_feats, width)
+        self.cross_attn = ResidualCrossAttentionBlock(
+            width=width,
+            heads=heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm
+        )
+
+        self.self_attn = None
+        if layers > 0:
+            self.self_attn = Transformer(
+                n_ctx=num_latents,
+                width=width,
+                layers=layers,
+                heads=heads,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm
+            )
+
+        if use_ln_post:
+            self.ln_post = nn.LayerNorm(width)
+        else:
+            self.ln_post = None
+
+    def sample_points_and_latents(self, pc: torch.FloatTensor, feats: Optional[torch.FloatTensor] = None):
+        B, N, D = pc.shape
+        num_pts = self.num_latents * self.downsample_ratio
+
+        # Compute number of latents
+        num_latents = int(num_pts / self.downsample_ratio)
+
+        # Compute the number of random and sharpedge latents
+        num_random_query = self.pc_size / (self.pc_size + self.pc_sharpedge_size) * num_latents
+        num_sharpedge_query = num_latents - num_random_query
+
+        # Split random and sharpedge surface points
+        random_pc, sharpedge_pc = torch.split(pc, [self.pc_size, self.pc_sharpedge_size], dim=1)
+        assert random_pc.shape[1] <= self.pc_size, "Random surface points size must be less than or equal to pc_size"
+        assert sharpedge_pc.shape[
+                   1] <= self.pc_sharpedge_size, "Sharpedge surface points size must be less than or equal to pc_sharpedge_size"
+
+        # Randomly select random surface points and random query points
+        input_random_pc_size = int(num_random_query * self.downsample_ratio)
+        random_query_ratio = num_random_query / input_random_pc_size
+        idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
+        input_random_pc = random_pc[:, idx_random_pc, :]
+        flatten_input_random_pc = input_random_pc.view(B * input_random_pc_size, D)
+        N_down = int(flatten_input_random_pc.shape[0] / B)
+        batch_down = torch.arange(B).to(pc.device)
+        batch_down = torch.repeat_interleave(batch_down, N_down)
+        idx_query_random = fps(flatten_input_random_pc, batch_down, ratio=random_query_ratio)
+        query_random_pc = flatten_input_random_pc[idx_query_random].view(B, -1, D)
+
+        # Randomly select sharpedge surface points and sharpedge query points
+        input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
+        if input_sharpedge_pc_size == 0:
+            input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype).to(pc.device)
+            query_sharpedge_pc = torch.zeros(B, 0, D, dtype=query_random_pc.dtype).to(pc.device)
+        else:
+            sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
+            idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
+                               :input_sharpedge_pc_size]
+            input_sharpedge_pc = sharpedge_pc[:, idx_sharpedge_pc, :]
+            flatten_input_sharpedge_surface_points = input_sharpedge_pc.view(B * input_sharpedge_pc_size, D)
+            N_down = int(flatten_input_sharpedge_surface_points.shape[0] / B)
+            batch_down = torch.arange(B).to(pc.device)
+            batch_down = torch.repeat_interleave(batch_down, N_down)
+            idx_query_sharpedge = fps(flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio)
+            query_sharpedge_pc = flatten_input_sharpedge_surface_points[idx_query_sharpedge].view(B, -1, D)
+
+        # Concatenate random and sharpedge surface points and query points
+        query_pc = torch.cat([query_random_pc, query_sharpedge_pc], dim=1)
+        input_pc = torch.cat([input_random_pc, input_sharpedge_pc], dim=1)
+
+        # PE
+        query = self.fourier_embedder(query_pc)
+        data = self.fourier_embedder(input_pc)
+
+        # Concat normal if given
+        if self.point_feats != 0:
+
+            random_surface_feats, sharpedge_surface_feats = torch.split(feats, [self.pc_size, self.pc_sharpedge_size],
+                                                                        dim=1)
+            input_random_surface_feats = random_surface_feats[:, idx_random_pc, :]
+            flatten_input_random_surface_feats = input_random_surface_feats.view(B * input_random_pc_size, -1)
+            query_random_feats = flatten_input_random_surface_feats[idx_query_random].view(B, -1,
+                                                                                           flatten_input_random_surface_feats.shape[
+                                                                                               -1])
+
+            if input_sharpedge_pc_size == 0:
+                input_sharpedge_surface_feats = torch.zeros(B, 0, self.point_feats,
+                                                            dtype=input_random_surface_feats.dtype).to(pc.device)
+                query_sharpedge_feats = torch.zeros(B, 0, self.point_feats, dtype=query_random_feats.dtype).to(
+                    pc.device)
+            else:
+                input_sharpedge_surface_feats = sharpedge_surface_feats[:, idx_sharpedge_pc, :]
+                flatten_input_sharpedge_surface_feats = input_sharpedge_surface_feats.view(B * input_sharpedge_pc_size,
+                                                                                           -1)
+                query_sharpedge_feats = flatten_input_sharpedge_surface_feats[idx_query_sharpedge].view(B, -1,
+                                                                                                        flatten_input_sharpedge_surface_feats.shape[
+                                                                                                            -1])
+
+            query_feats = torch.cat([query_random_feats, query_sharpedge_feats], dim=1)
+            input_feats = torch.cat([input_random_surface_feats, input_sharpedge_surface_feats], dim=1)
+
+            if self.normal_pe:
+                query_normal_pe = self.fourier_embedder(query_feats[..., :3])
+                input_normal_pe = self.fourier_embedder(input_feats[..., :3])
+                query_feats = torch.cat([query_normal_pe, query_feats[..., 3:]], dim=-1)
+                input_feats = torch.cat([input_normal_pe, input_feats[..., 3:]], dim=-1)
+
+            query = torch.cat([query, query_feats], dim=-1)
+            data = torch.cat([data, input_feats], dim=-1)
+
+        if input_sharpedge_pc_size == 0:
+            query_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
+            input_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
+
+        return query.view(B, -1, query.shape[-1]), data.view(B, -1, data.shape[-1]), [query_pc, input_pc,
+                                                                                      query_random_pc, input_random_pc,
+                                                                                      query_sharpedge_pc,
+                                                                                      input_sharpedge_pc]
+
+    def forward(self, pc, feats):
+        """
+
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
+
+        Returns:
+
+        """
+
+        query, data, pc_infos = self.sample_points_and_latents(pc, feats)
+
+        query = self.input_proj(query)
+        query = query
+        data = self.input_proj(data)
+        data = data
+
+        latents = self.cross_attn(query, data)
+        if self.self_attn is not None:
+            latents = self.self_attn(latents)
+
+        if self.ln_post is not None:
+            latents = self.ln_post(latents)
+
+        return latents, pc_infos
