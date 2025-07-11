@@ -181,7 +181,7 @@ class Hunyuan3DDiTPipeline:
             scheduler = instantiate_from_config(config['scheduler'])
         
         model.load_state_dict(ckpt['model'], assign = True)
-        vae.load_state_dict(ckpt['vae'], assign = True)
+        vae.load_state_dict(ckpt['vae'], assign = True, strict=False)
         if 'conditioner' in ckpt:
             conditioner.load_state_dict(ckpt['conditioner'], assign = True)
 
