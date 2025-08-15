@@ -204,11 +204,6 @@ class ShapeVAE(VectsetVAE):
         width: int,
         heads: int,
         num_decoder_layers: int,
-        num_encoder_layers: int = 8,
-        pc_size: int = 5120,
-        pc_sharpedge_size: int = 5120,
-        point_feats: int = 3,
-        downsample_ratio: int = 20,
         geo_decoder_downsample_ratio: int = 1,
         geo_decoder_mlp_expand_ratio: int = 4,
         geo_decoder_ln_post: bool = True,
@@ -219,31 +214,12 @@ class ShapeVAE(VectsetVAE):
         label_type: str = "binary",
         drop_path_rate: float = 0.0,
         scale_factor: float = 1.0,
-        use_ln_post: bool = True,
-        ckpt_path=None
     ):
         super().__init__()
         self.geo_decoder_ln_post = geo_decoder_ln_post
-        self.downsample_ratio = downsample_ratio
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
 
-        self.encoder = PointCrossAttentionEncoder(
-            fourier_embedder=self.fourier_embedder,
-            num_latents=num_latents,
-            downsample_ratio=self.downsample_ratio,
-            pc_size=pc_size,
-            pc_sharpedge_size=pc_sharpedge_size,
-            point_feats=point_feats,
-            width=width,
-            heads=heads,
-            layers=num_encoder_layers,
-            qkv_bias=qkv_bias,
-            use_ln_post=use_ln_post,
-            qk_norm=qk_norm
-        )
-
-        self.pre_kl = nn.Linear(width, embed_dim * 2)
         self.post_kl = nn.Linear(embed_dim, width)
 
         self.transformer = Transformer(
@@ -272,9 +248,6 @@ class ShapeVAE(VectsetVAE):
 
         self.scale_factor = scale_factor
         self.latent_shape = (num_latents, embed_dim)
-
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path)
 
     def forward(self, latents):
         latents = self.post_kl(latents)
